@@ -1,0 +1,420 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # =================================================================
+  # STAGE 1: LINT
+  # =================================================================
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install flake8
+        run: pip install flake8==7.0.0
+
+      - name: Lint Python (API)
+        run: flake8 api/ --exclude=api/tests,api/__pycache__
+
+      - name: Lint Python (worker)
+        run: flake8 worker/
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install ESLint
+        working-directory: frontend
+        run: |
+          npm install --save-dev eslint@8.57.0
+          
+      - name: Lint JavaScript (frontend)
+        working-directory: frontend
+        run: npx eslint app.js
+
+      - name: Lint Dockerfiles with Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: api/Dockerfile
+
+      - name: Lint worker Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: worker/Dockerfile
+
+      - name: Lint frontend Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: frontend/Dockerfile
+
+  # =================================================================
+  # STAGE 2: TEST (unit tests with Redis mocked + coverage)
+  # =================================================================
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install API dev dependencies
+        working-directory: api
+        run: pip install -r requirements-dev.txt
+
+      - name: Run pytest with coverage
+        working-directory: api
+        run: pytest tests/ -v --cov=main --cov-report=xml --cov-report=term --cov-report=html
+
+      - name: Upload coverage report (XML)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: api/coverage.xml
+
+      - name: Upload coverage report (HTML)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: api/htmlcov/
+
+  # =================================================================
+  # STAGE 3: BUILD (build all images, push to local registry)
+  # =================================================================
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./api
+          push: true
+          tags: |
+            localhost:5000/jobsys-api:${{ github.sha }}
+            localhost:5000/jobsys-api:latest
+
+      - name: Build and push worker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./worker
+          push: true
+          tags: |
+            localhost:5000/jobsys-worker:${{ github.sha }}
+            localhost:5000/jobsys-worker:latest
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            localhost:5000/jobsys-frontend:${{ github.sha }}
+            localhost:5000/jobsys-frontend:latest
+
+      - name: Save images as tarballs for downstream jobs
+        run: |
+          mkdir -p /tmp/images
+          docker pull localhost:5000/jobsys-api:${{ github.sha }}
+          docker pull localhost:5000/jobsys-worker:${{ github.sha }}
+          docker pull localhost:5000/jobsys-frontend:${{ github.sha }}
+          docker tag localhost:5000/jobsys-api:${{ github.sha }} jobsys-api:ci
+          docker tag localhost:5000/jobsys-worker:${{ github.sha }} jobsys-worker:ci
+          docker tag localhost:5000/jobsys-frontend:${{ github.sha }} jobsys-frontend:ci
+          docker save jobsys-api:ci -o /tmp/images/api.tar
+          docker save jobsys-worker:ci -o /tmp/images/worker.tar
+          docker save jobsys-frontend:ci -o /tmp/images/frontend.tar
+
+      - name: Upload images for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp/images/
+          retention-days: 1
+
+  # =================================================================
+  # STAGE 4: SECURITY SCAN (Trivy — fail on CRITICAL)
+  # =================================================================
+  security-scan:
+    name: Security scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download built images
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp/images/
+
+      - name: Load images into Docker
+        run: |
+          docker load -i /tmp/images/api.tar
+          docker load -i /tmp/images/worker.tar
+          docker load -i /tmp/images/frontend.tar
+
+      - name: Scan API with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: jobsys-api:ci
+          format: sarif
+          output: trivy-api.sarif
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Scan worker with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: jobsys-worker:ci
+          format: sarif
+          output: trivy-worker.sarif
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Scan frontend with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: jobsys-frontend:ci
+          format: sarif
+          output: trivy-frontend.sarif
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload SARIF results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sarif-reports
+          path: trivy-*.sarif
+
+  # =================================================================
+  # STAGE 5: INTEGRATION TEST (full stack end-to-end)
+  # =================================================================
+  integration-test:
+    name: Integration test
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download built images
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp/images/
+
+      - name: Load images into Docker
+        run: |
+          docker load -i /tmp/images/api.tar
+          docker load -i /tmp/images/worker.tar
+          docker load -i /tmp/images/frontend.tar
+          docker tag jobsys-api:ci hng14-stage2-devops-api:latest
+          docker tag jobsys-worker:ci hng14-stage2-devops-worker:latest
+          docker tag jobsys-frontend:ci hng14-stage2-devops-frontend:latest
+
+      - name: Create .env file
+        run: |
+          cat > .env << 'EOF'
+          REDIS_HOST=redis
+          REDIS_PORT=6379
+          API_PORT=8000
+          FRONTEND_PORT=3000
+          API_URL=http://api:8000
+          APP_ENV=production
+          EOF
+
+      - name: Bring up full stack (use prebuilt images, skip build)
+        run: |
+          cat > docker-compose.ci.yml << 'EOF'
+          services:
+            redis:
+              image: redis:7.2-alpine
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 5s
+                timeout: 3s
+                retries: 5
+              networks: [jobsys-net]
+            api:
+              image: hng14-stage2-devops-api:latest
+              environment:
+                REDIS_HOST: redis
+                REDIS_PORT: 6379
+              ports:
+                - "8000:8000"
+              depends_on:
+                redis: {condition: service_healthy}
+              networks: [jobsys-net]
+            worker:
+              image: hng14-stage2-devops-worker:latest
+              environment:
+                REDIS_HOST: redis
+                REDIS_PORT: 6379
+              depends_on:
+                redis: {condition: service_healthy}
+                api: {condition: service_healthy}
+              networks: [jobsys-net]
+            frontend:
+              image: hng14-stage2-devops-frontend:latest
+              environment:
+                API_URL: http://api:8000
+                PORT: 3000
+              ports:
+                - "3000:3000"
+              depends_on:
+                api: {condition: service_healthy}
+              networks: [jobsys-net]
+          networks:
+            jobsys-net:
+              driver: bridge
+          EOF
+          docker compose -f docker-compose.ci.yml up -d
+
+      - name: Wait for services to be healthy
+        run: |
+          for i in {1..30}; do
+            if curl -fs http://localhost:3000/health && curl -fs http://localhost:8000/health; then
+              echo "All services healthy"
+              exit 0
+            fi
+            echo "Attempt $i: waiting 3s..."
+            sleep 3
+          done
+          echo "Services failed to become healthy"
+          docker compose -f docker-compose.ci.yml ps
+          docker compose -f docker-compose.ci.yml logs
+          exit 1
+
+      - name: Submit a job through the frontend and assert completion
+        run: |
+          RESPONSE=$(curl -fsS -X POST http://localhost:3000/submit)
+          JOB_ID=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['job_id'])")
+          echo "Submitted job: $JOB_ID"
+          for i in {1..20}; do
+            STATUS=$(curl -fsS http://localhost:3000/status/$JOB_ID | python3 -c "import sys, json; print(json.load(sys.stdin).get('status', 'unknown'))")
+            echo "Attempt $i: status=$STATUS"
+            if [ "$STATUS" = "completed" ]; then
+              echo "Job completed successfully"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Job did not complete in time"
+          docker compose -f docker-compose.ci.yml logs worker
+          exit 1
+
+      - name: Tear down stack (always runs)
+        if: always()
+        run: docker compose -f docker-compose.ci.yml down -v
+
+  # =================================================================
+  # STAGE 6: DEPLOY (rolling update, main branch only)
+  # =================================================================
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download built images
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp/images/
+
+      - name: Load new images
+        run: |
+          docker load -i /tmp/images/api.tar
+          docker load -i /tmp/images/worker.tar
+          docker load -i /tmp/images/frontend.tar
+
+      - name: Simulate rolling update
+        run: |
+          cat > .env << 'EOF'
+          REDIS_HOST=redis
+          REDIS_PORT=6379
+          API_PORT=8000
+          FRONTEND_PORT=3000
+          API_URL=http://api:8000
+          APP_ENV=production
+          EOF
+
+          echo "Starting rolling update simulation..."
+
+          docker network create deploy-net || true
+          docker run -d --name old-api --network deploy-net \
+            -e REDIS_HOST=redis -e REDIS_PORT=6379 \
+            -p 8000:8000 jobsys-api:ci || echo "No old container running, starting fresh"
+
+          echo "Deploying new version..."
+          docker stop old-api 2>/dev/null || true
+          docker rm old-api 2>/dev/null || true
+
+          docker run -d --name new-api --network deploy-net \
+            -e REDIS_HOST=redis -e REDIS_PORT=6379 \
+            -p 8000:8000 jobsys-api:ci
+
+          echo "Waiting up to 60s for new container to be healthy..."
+          HEALTHY=false
+          for i in {1..20}; do
+            if docker inspect --format='{{.State.Health.Status}}' new-api 2>/dev/null | grep -q healthy; then
+              HEALTHY=true
+              echo "New container healthy after ${i} checks"
+              break
+            fi
+            sleep 3
+          done
+
+          if [ "$HEALTHY" = "false" ]; then
+            echo "Health check failed within 60s, aborting deploy"
+            docker logs new-api
+            docker stop new-api
+            docker rm new-api
+            exit 1
+          fi
+
+          echo "Rolling update complete"
+          docker stop new-api && docker rm new-api
+          docker network rm deploy-net
